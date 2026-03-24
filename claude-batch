@@ -1,5 +1,5 @@
 #!/bin/bash
-# claude-batch v5.5 — tmux-isolated parallel claude -p
+# claude-batch v5.7 — tmux-isolated parallel claude -p
 #
 # Strategy: PREVENT REFRESH, DON'T FIX RACE
 # (6/6 consilium APPROVE, 5-agent red team validated)
@@ -206,10 +206,10 @@ cmd_run() {
         err "Failed to create tmux session"; exit 1
     }
 
-    # Wait with hard timeout
+    # Wait with hard timeout (sleep 1s, not 0.5 — elapsed must match real seconds)
     local elapsed=0
     while [ ! -f "$job_dir/exit_code" ] && [ "$elapsed" -lt "$JOB_TIMEOUT" ]; do
-        sleep 0.5; elapsed=$((elapsed + 1))
+        sleep 1; elapsed=$((elapsed + 1))
     done
 
     # Read results before cleanup
@@ -246,26 +246,25 @@ cmd_batch() {
     log "=== Pre-flight ==="
     ensure_token_fresh || exit 1
 
-    # Clean stale job dirs (Issue 3), but NOT dirs from running batches (Issue 6)
+    local batch_id="batch-$$-$(date +%s)"
+
+    # Clean stale job dirs (Issue 3+6 fix: skip current batch, age = JOB_TIMEOUT*2)
+    # Consilium 2026-03-24: 3/4 APPROVE. Option C — no markers, no PID check.
+    local stale_threshold=$(( JOB_TIMEOUT * 2 / 60 ))  # minutes
     if [ -d "$JOB_BASE" ]; then
         local cleaned=0
         for stale_dir in "$JOB_BASE"/batch-*; do
             [ -d "$stale_dir" ] || continue
-            # Extract PID from dir name (batch-PID-TIMESTAMP-...)
-            local dir_pid
-            dir_pid=$(basename "$stale_dir" | cut -d- -f2)
-            # Skip if that PID is still alive (running batch)
-            if [ -n "$dir_pid" ] && kill -0 "$dir_pid" 2>/dev/null; then
-                continue
-            fi
-            # Only remove if older than 30 min
-            local dir_age
-            dir_age=$(find "$stale_dir" -maxdepth 0 -mmin +30 2>/dev/null)
-            if [ -n "$dir_age" ]; then
-                rm -r "$stale_dir" 2>/dev/null && cleaned=$((cleaned + 1))
+            # Skip dirs belonging to THIS batch (by batch_id prefix)
+            case "$(basename "$stale_dir")" in
+                "$batch_id"*) continue ;;
+            esac
+            # Only remove if older than JOB_TIMEOUT*2
+            if find "$stale_dir" -maxdepth 0 -mmin +"$stale_threshold" 2>/dev/null | grep -q .; then
+                rm -r -- "$stale_dir" 2>/dev/null && cleaned=$((cleaned + 1))
             fi
         done
-        [ "$cleaned" -gt 0 ] && log "Cleaned $cleaned stale job dirs"
+        [ "$cleaned" -gt 0 ] && log "Cleaned $cleaned stale job dirs (threshold: ${stale_threshold}min)"
     fi
 
     # Collect prompts
@@ -287,7 +286,6 @@ cmd_batch() {
         tmux kill-session -t "$s" 2>/dev/null || true
     done || true
 
-    local batch_id="batch-$$-$(date +%s)"
     trap '_cleanup_batch' EXIT INT TERM
 
     log "Found $total prompts, parallel=$parallel, model=$model"
@@ -329,12 +327,13 @@ cmd_batch() {
         cat "$prompt_file" > "$prompt_tmp"
 
         # tmux command reads prompt from file, not inline arg
+        # stdin pipe (not $(cat) inline — handles special chars in prompt)
         tmux kill-session -t "$session_name" 2>/dev/null || true
         tmux new-session -d -s "$session_name" \
-            "claude -p \"\$(cat '$prompt_tmp')\" --model $model > '$job_dir/stdout.log' 2>'$job_dir/stderr.log'; echo \$? > '$job_dir/exit_code'" 2>/dev/null || {
+            "cat '$prompt_tmp' | claude -p --model $model > '$job_dir/stdout.log' 2>'$job_dir/stderr.log'; echo \$? > '$job_dir/exit_code'" 2>/dev/null || {
             session_name="${session_name}-${RANDOM}"
             tmux new-session -d -s "$session_name" \
-                "claude -p \"\$(cat '$prompt_tmp')\" --model $model > '$job_dir/stdout.log' 2>'$job_dir/stderr.log'; echo \$? > '$job_dir/exit_code'" 2>/dev/null || {
+                "cat '$prompt_tmp' | claude -p --model $model > '$job_dir/stdout.log' 2>'$job_dir/stderr.log'; echo \$? > '$job_dir/exit_code'" 2>/dev/null || {
                 warn "Failed to create tmux session for $wid"
                 fail_count=$((fail_count + 1)); continue
             }
@@ -401,7 +400,7 @@ _reap_finished_jobs() {
             local stdout_size=0
             [ -f "$jdir/stdout.log" ] && stdout_size=$(wc -c < "$jdir/stdout.log" | tr -d ' ')
 
-            if [ "$rc" = "0" ] && [ "$stdout_size" -gt 1 ]; then
+            if [ "$rc" = "0" ] && [ "$stdout_size" -gt 100 ]; then
                 cp "$jdir/stdout.log" "$rfile"
                 log "[OK] $wid (${stdout_size}b)"
                 ok_count=$((ok_count + 1))
@@ -429,7 +428,7 @@ _reap_finished_jobs() {
 
                 tmux kill-session -t "$retry_sess" 2>/dev/null || true
                 tmux new-session -d -s "$retry_sess" \
-                    "claude -p \"\$(cat '$retry_dir/prompt.txt')\" --model $model > '$retry_dir/stdout.log' 2>'$retry_dir/stderr.log'; echo \$? > '$retry_dir/exit_code'" 2>/dev/null
+                    "cat '$retry_dir/prompt.txt' | claude -p --model $model > '$retry_dir/stdout.log' 2>'$retry_dir/stderr.log'; echo \$? > '$retry_dir/exit_code'" 2>/dev/null
 
                 new_active+=("${retry_sess}|${retry_dir}|${wid}|${rfile}|${pfile}|${next_retry}|$(date +%s)")
             else
@@ -463,7 +462,7 @@ Batch:    claude-batch batch -f prompts/ -p 10 -m sonnet -o results/
 Check:    claude-batch check
 Restore:  claude-batch restore
 
-Safety: 2h token gate, per-job 5min timeout, retry with jitter,
+Safety: 2h token gate, per-job 10min timeout, retry with jitter,
 prompt via file, tmux isolation, scoped cleanup.
 USAGE
         exit 1 ;;
